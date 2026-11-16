@@ -9,22 +9,26 @@ SHORTCUT="${ENTE_QUICK_SHORTCUT:-<Control><Alt>a}"
 mkdir -p "$BIN" "$APPS"
 
 [ -x /usr/share/enteauth/enteauth ] || { echo "Ente Auth not found in /usr/share/enteauth — install it first." >&2; exit 1; }
-for t in python3 wl-copy wl-paste perl; do command -v $t >/dev/null || { echo "missing: $t" >&2; exit 1; }; done
+for t in python3 wl-copy wl-paste perl notify-send; do command -v $t >/dev/null || { echo "missing: $t" >&2; exit 1; }; done
 python3 -c 'import gi; gi.require_version("Gtk","4.0"); gi.require_version("Adw","1"); gi.require_version("Secret","1")' \
   || { echo "missing: python3-gi with GTK4, libadwaita and libsecret typelibs" >&2; exit 1; }
 
 echo "• scripts"
 install -m 755 bin/ente-quick bin/enteauth-personal-update "$BIN/"
 
-echo "• Personal copy of Ente Auth"
-"$BIN/enteauth-personal-update"
+if [ "${ENTE_SKIP_PERSONAL:-0}" = 1 ]; then
+  echo "• Personal copy: skipped (ENTE_SKIP_PERSONAL=1)"
+else
+  echo "• Personal copy of Ente Auth"
+  "$BIN/enteauth-personal-update"
+fi
 
 echo "• menu entries"
 # The original install becomes "Work" (user-level override of the system entry).
 sed -e 's/^Name=Ente Auth$/Name=Ente Auth (Work)/' \
     -e 's/^GenericName=.*/GenericName=Ente Authenticator – Work account/' \
     /usr/share/applications/enteauth.desktop > "$APPS/enteauth.desktop"
-cat > "$APPS/enteauth-personal.desktop" <<EOF
+[ "${ENTE_SKIP_PERSONAL:-0}" = 1 ] || cat > "$APPS/enteauth-personal.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Ente Auth (Personal)

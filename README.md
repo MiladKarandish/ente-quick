@@ -1,73 +1,95 @@
 # ente-quick
 
-Two Ente Auth accounts (Work + Personal) side by side on Linux, plus a
-keyboard popup to search and copy 2FA codes from both without opening the apps.
+Run two [Ente Auth](https://ente.io/auth) accounts side by side on Linux, and copy any 2FA code with a keyboard shortcut.
 
-> Unofficial. Not affiliated with or endorsed by Ente. It contains no Ente code;
-> it works with an Ente Auth you already installed (the `.deb` build).
+- **Two accounts:** a second Ente Auth install (e.g. Work + Personal) with its own data, login and keyring entry. Codes never mix or sync between them.
+- **Quick copy:** press `Ctrl+Alt+A`, type a few letters, press `Enter`. The code is copied, kept out of clipboard history, and cleared after 30 s.
 
-## What's in here
+> Unofficial. Not affiliated with or endorsed by Ente. Contains no Ente code.
 
-| File | What it does |
+## Requirements
+
+- GNOME on Wayland (tested: Ubuntu 26.04, GNOME 50, Ente Auth 4.4.26)
+- Ente Auth installed from the official **`.deb`** (`/usr/share/enteauth`)
+- Packages:
+
+  ```sh
+  sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 gir1.2-secret-1 wl-clipboard libnotify-bin
+  ```
+
+## Install
+
+```sh
+git clone https://github.com/MiladKarandish/ente-quick.git
+cd ente-quick
+./install.sh
+```
+
+Then open **Ente Auth (Personal)** from the app menu and sign in to your second account. Your existing install becomes **Ente Auth (Work)**.
+
+| Option | Effect |
 |---|---|
-| `bin/ente-quick` | The popup (Python, GTK4/libadwaita). `Ctrl+Alt+A` → type → `Enter` copies the code. |
-| `bin/enteauth-personal-update` | Builds the **Personal** copy of Ente Auth from the installed one. Re-run after every Ente Auth update. |
-| `install.sh` | Installs everything: scripts, Personal copy, menu entries, shortcut, clipboard-history exclusions. Safe to re-run. |
+| `ENTE_QUICK_SHORTCUT='<Super>semicolon' ./install.sh` | Use a different shortcut |
+| `ENTE_SKIP_PERSONAL=1 ./install.sh` | Popup only, no second account |
 
-## How the second account works
+Re-running `install.sh` is safe. It rebuilds the Personal copy, so close that app first.
 
-Ente Auth (Linux, Flutter) bakes its app ID `io.ente.auth` into the launcher and
-the secure-storage plugin. That ID decides the data folder, the keyring entry
-and the single-instance lock. The Personal copy is the same build with the ID
-changed to `io.ente.autw` (same length, one byte each), so it gets its own data
-in `~/.local/share/io.ente.autw` and its own keyring entry. No rebuild needed.
+## Usage
 
-- **Ente Auth (Work)**: the original install (`/usr/share/enteauth`)
-- **Ente Auth (Personal)**: `~/.local/opt/enteauth-personal`
+| Key | Action |
+|---|---|
+| `Ctrl+Alt+A` | Open / close the popup |
+| type | Filter by name, account, tag, note, or `work` / `personal` |
+| `↑` `↓` | Move selection |
+| `Enter` or click | Copy code and close |
+| `Esc` | Close |
 
-## How the popup works
+Pinned codes come first, then the ones you copy most. `ente-quick --check` prints how many codes it finds per account.
 
-- Reads each app's `auth_secret_key` from the GNOME keyring (same as the app does),
-  decrypts the local SQLite DB in memory (libsodium secretstream), computes
-  TOTP/Steam codes locally. Nothing decrypted is written to disk.
-- Codes reflect each app's last sync; the apps don't need to be running.
-- Copy is done from the popup's own window, so Clipboard Indicator's
-  `excluded-apps` keeps codes out of history. The process then stays in the
-  background as clipboard owner and clears it after 30 s (or exits early if you
-  copy something else). Falls back to `wl-copy` if the compositor refuses.
-- Pinned codes first, then most used (`~/.local/state/ente-quick/usage.json`
-  stores only hashed names and counts). Trashed codes hidden. HOTP shows "use app".
+**After every Ente Auth update**, run `enteauth-personal-update` so the Personal copy matches.
 
-## Security notes
+## Configuration
 
-- The popup can read codes only from the logged-in user's **unlocked** GNOME
-  keyring. Any program running as you can already do the same: that is how
-  Ente Auth stores its key on Linux. This tool adds no new access.
-- Codes are copied to the clipboard and cleared after 30 seconds. Other
-  clipboard managers than Clipboard Indicator may still record them; exclude
-  the app IDs `local.ente.Quick`, `io.ente.auth` and `io.ente.autw` there.
-- Ente Auth's own app lock (PIN/password inside the app) is **not** applied to
-  the popup. If you rely on it, lock your screen or don't install the popup.
+Edit the top of `bin/ente-quick`, then re-run `./install.sh`:
 
-## Install / reinstall
+- `ACCOUNTS`: labels and app IDs (rename "Work"/"Personal" here)
+- `CLIPBOARD_CLEAR_SECONDS`: default `30`
 
-```sh
-./install.sh                                         # default shortcut Ctrl+Alt+A
-ENTE_QUICK_SHORTCUT='<Super>semicolon' ./install.sh  # pick another
-```
+## How it works
 
-Note: re-running closes the Personal copy if it is open (it gets rebuilt).
+- **Second account:** Ente Auth's app ID `io.ente.auth` decides its data folder, keyring entry and single-instance lock. The Personal copy is the same build with the ID changed to `io.ente.autw` (same length) in two files. No rebuild.
+- **Popup:** reads each install's key from the GNOME keyring, decrypts its local database in memory, and computes TOTP/Steam codes. Nothing decrypted is written to disk. The apps don't need to be running, but codes reflect each app's last sync.
 
-## After an Ente Auth update
+## Security
+
+- The popup reads codes from your **unlocked** keyring, which any program running as you can already do. It adds no new access.
+- **Ente Auth's in-app lock (PIN/password) does not apply to the popup.** Lock your screen when away.
+- Clipboard history: `install.sh` excludes the popup and both apps in the Clipboard Indicator extension. For other clipboard managers, exclude `local.ente.Quick`, `io.ente.auth` and `io.ente.autw` yourself.
+
+## Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| "not signed in" for an account | Sign in to that Ente Auth app once. |
+| Personal copy won't start after an update | Run `enteauth-personal-update`. |
+| A new code is missing | Open that Ente Auth app so it syncs. |
+| HOTP code shows "use app" | Counter-based codes must be used in the app (it advances the counter). |
+
+## Uninstall
 
 ```sh
-enteauth-personal-update
+./uninstall.sh --dry-run   # preview
+./uninstall.sh             # remove everything install.sh added
+./uninstall.sh --purge     # also delete the Personal account's local data
 ```
+
+Your Work install and its data are never touched.
+
+## Limitations
+
+- Only the `.deb` install is supported (not Flatpak, AppImage or Snap).
+- GNOME Wayland only. KDE or X11 need a different shortcut and clipboard setup.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
-
-## Tested on
-
-Ubuntu 26.04, GNOME 50 (Wayland), Ente Auth 4.4.26.
+[MIT](LICENSE)
