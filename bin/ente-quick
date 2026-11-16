@@ -1,0 +1,445 @@
+#!/usr/bin/env python3
+"""ente-quick — a keyboard popup for Ente Auth codes (Work + Personal).
+
+Reads each Ente Auth install's key from the GNOME keyring, decrypts its local
+code database in memory, and shows live TOTP codes. Type to filter, Enter (or
+click) copies the code and closes. Nothing decrypted is ever written to disk.
+"""
+import base64, ctypes, hashlib, hmac, json, os, sqlite3, struct, subprocess, sys, time
+from urllib.parse import urlparse, parse_qs, unquote
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+gi.require_version("Secret", "1")
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango, Secret
+
+# label, app id (keyring + data folder name)
+ACCOUNTS = [
+    ("Work", "io.ente.auth"),
+    ("Personal", "io.ente.autw"),
+]
+CLIPBOARD_CLEAR_SECONDS = 30
+STATE = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "ente-quick")
+USAGE_FILE = os.path.join(STATE, "usage.json")
+STEAM_ALPHABET = "23456789BCDFGHJKMNPQRTVWXY"
+
+
+# ---------------------------------------------------------------- decryption
+def _sodium():
+    for name in ("libsodium.so.23", "libsodium.so", "/usr/share/enteauth/lib/libsodium.so"):
+        try:
+            lib = ctypes.CDLL(name)
+            lib.sodium_init()
+            return lib
+        except OSError:
+            continue
+    raise RuntimeError("libsodium not found")
+
+
+SODIUM = _sodium()
+_SCHEMA = Secret.Schema.new("!", Secret.SchemaFlags.DONT_MATCH_NAME,
+                            {"account": Secret.SchemaAttributeType.STRING})
+
+
+def _auth_key(app_id):
+    raw = Secret.password_lookup_sync(_SCHEMA, {"account": f"{app_id}.secureStorage"}, None)
+    if not raw:
+        return None
+    store = json.loads(raw)
+    k = store.get("auth_secret_key") or store.get("offline_auth_secret_key")
+    return base64.b64decode(k) if k else None
+
+
+def _decrypt(key, data, header):
+    st = ctypes.create_string_buffer(SODIUM.crypto_secretstream_xchacha20poly1305_statebytes())
+    if SODIUM.crypto_secretstream_xchacha20poly1305_init_pull(st, header, key) != 0:
+        raise ValueError("bad header")
+    out = ctypes.create_string_buffer(len(data))
+    olen, tag = ctypes.c_ulonglong(), ctypes.c_ubyte()
+    if SODIUM.crypto_secretstream_xchacha20poly1305_pull(
+            st, out, ctypes.byref(olen), ctypes.byref(tag),
+            data, ctypes.c_ulonglong(len(data)), None, ctypes.c_ulonglong(0)) != 0:
+        raise ValueError("decrypt failed")
+    return out.raw[:olen.value].decode()
+
+
+def _db_paths(app_id):
+    base = os.path.join(os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")), app_id)
+    # online: ".ente.authenticator.db", offline mode: "ente.offline_authenticator.db"
+    names = (".ente.authenticator.db", "ente.offline_authenticator.db", ".ente.offline_authenticator.db")
+    return [p for p in (os.path.join(base, n) for n in names) if os.path.exists(p)]
+
+
+def _parse(uri, label):
+    u = urlparse(uri)
+    q = {k: v[0] for k, v in parse_qs(u.query).items()}
+    display = {}
+    if "codeDisplay" in q:
+        try:
+            display = json.loads(q["codeDisplay"])
+        except ValueError:
+            pass
+    if display.get("trashed"):
+        return None
+    path = unquote(u.path.lstrip("/"))
+    issuer = q.get("issuer", "")
+    account = path
+    if ":" in path:
+        pi, account = path.split(":", 1)
+        issuer = issuer or pi
+    secret = q.get("secret", "").upper().replace(" ", "").replace("-", "").rstrip("=")
+    kind = (u.netloc or "totp").lower()
+    return {
+        "group": label,
+        "issuer": issuer.strip() or account.strip() or "(no name)",
+        "account": account.strip(),
+        "secret": base64.b32decode(secret + "=" * (-len(secret) % 8)),
+        "type": kind,
+        "digits": 5 if kind == "steam" else int(q.get("digits", 6)),
+        "period": int(q.get("period", 30)),
+        "algo": q.get("algorithm", "SHA1").lower(),
+        "counter": int(q.get("counter", 0)),
+        "pinned": bool(display.get("pinned")),
+        "tags": display.get("tags", []),
+        "note": display.get("note", ""),
+    }
+
+
+def load_codes():
+    codes, problems = [], []
+    for label, app_id in ACCOUNTS:
+        dbs = _db_paths(app_id)
+        if not dbs:
+            continue
+        try:
+            key = _auth_key(app_id)
+        except Exception as e:  # keyring locked / unavailable
+            problems.append(f"{label}: keyring error ({e})")
+            continue
+        if key is None:
+            problems.append(f"{label}: not signed in")
+            continue
+        for db in dbs:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            for enc, hdr in con.execute("SELECT encryptedData, header FROM entities"):
+                try:
+                    raw = _decrypt(key, base64.b64decode(enc), base64.b64decode(hdr))
+                    if raw.startswith('"'):
+                        raw = json.loads(raw)
+                    c = _parse(raw, label)
+                    if c:
+                        codes.append(c)
+                except Exception:
+                    problems.append(f"{label}: skipped an unreadable entry")
+            con.close()
+    return codes, problems
+
+
+# ---------------------------------------------------------------- OTP
+def otp(c, now=None):
+    now = time.time() if now is None else now
+    counter = c["counter"] if c["type"] == "hotp" else int(now // c["period"])
+    digest = hmac.new(c["secret"], struct.pack(">Q", counter), getattr(hashlib, c["algo"], hashlib.sha1)).digest()
+    o = digest[-1] & 0x0F
+    n = struct.unpack(">I", digest[o:o + 4])[0] & 0x7FFFFFFF
+    if c["type"] == "steam":
+        s = ""
+        for _ in range(5):
+            s += STEAM_ALPHABET[n % len(STEAM_ALPHABET)]
+            n //= len(STEAM_ALPHABET)
+        return s
+    return str(n % 10 ** c["digits"]).zfill(c["digits"])
+
+
+def pretty(code):
+    if len(code) == 6:
+        return f"{code[:3]} {code[3:]}"
+    if len(code) == 8:
+        return f"{code[:4]} {code[4:]}"
+    return code
+
+
+def code_id(c):
+    return hashlib.sha256(f'{c["group"]}|{c["issuer"]}|{c["account"]}'.encode()).hexdigest()[:16]
+
+
+def load_usage():
+    try:
+        with open(USAGE_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def bump_usage(c):
+    u = load_usage()
+    u[code_id(c)] = u.get(code_id(c), 0) + 1
+    os.makedirs(STATE, exist_ok=True)
+    with open(USAGE_FILE, "w") as f:
+        json.dump(u, f)
+
+
+# ---------------------------------------------------------------- UI
+CSS = b"""
+.code { font-family: monospace; font-size: 20px; font-weight: 700; letter-spacing: 1px; }
+.code.expiring { color: @error_color; }
+.secs { font-size: 11px; min-width: 26px; }
+.pill { font-size: 10px; font-weight: 700; padding: 1px 7px; border-radius: 99px; }
+.pill.Work { background: alpha(@accent_bg_color, .18); color: @accent_color; }
+.pill.Personal { background: alpha(@success_color, .18); color: @success_color; }
+.issuer { font-weight: 700; }
+row.code-row { padding: 6px 4px; }
+"""
+
+
+class CodeRow(Gtk.ListBoxRow):
+    def __init__(self, c):
+        super().__init__()
+        self.c = c
+        self.add_css_class("code-row")
+        self.haystack = " ".join([c["issuer"], c["account"], c["group"], c["note"], *c["tags"]]).lower()
+
+        box = Gtk.Box(spacing=10, margin_start=8, margin_end=8)
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True, valign=Gtk.Align.CENTER)
+        top = Gtk.Box(spacing=6)
+        name = Gtk.Label(label=("📌 " if c["pinned"] else "") + c["issuer"], xalign=0,
+                         ellipsize=Pango.EllipsizeMode.END)
+        name.add_css_class("issuer")
+        pill = Gtk.Label(label=c["group"])
+        pill.add_css_class("pill")
+        pill.add_css_class(c["group"])
+        top.append(name)
+        top.append(pill)
+        left.append(top)
+        if c["account"]:
+            acc = Gtk.Label(label=c["account"], xalign=0, ellipsize=Pango.EllipsizeMode.END)
+            acc.add_css_class("dim-label")
+            acc.add_css_class("caption")
+            left.append(acc)
+
+        self.code_lbl = Gtk.Label(valign=Gtk.Align.CENTER)
+        self.code_lbl.add_css_class("code")
+        self.secs_lbl = Gtk.Label(valign=Gtk.Align.CENTER, xalign=1)
+        self.secs_lbl.add_css_class("secs")
+        self.secs_lbl.add_css_class("dim-label")
+
+        box.append(left)
+        box.append(self.code_lbl)
+        box.append(self.secs_lbl)
+        self.set_child(box)
+        self.tick()
+
+    def tick(self):
+        now = time.time()
+        if self.c["type"] == "hotp":
+            # Ente bumps the HOTP counter when used; a code from here could be stale.
+            self.code_lbl.set_label("use app")
+            self.secs_lbl.set_label("")
+            return
+        self.code_lbl.set_label(pretty(otp(self.c, now)))
+        left = self.c["period"] - int(now) % self.c["period"]
+        self.secs_lbl.set_label(f"{left}s")
+        if left <= 5:
+            self.code_lbl.add_css_class("expiring")
+        else:
+            self.code_lbl.remove_css_class("expiring")
+
+
+class Win(Adw.ApplicationWindow):
+    def __init__(self, app, codes, problems):
+        super().__init__(application=app, title="Ente codes", default_width=440, default_height=520)
+        self.copied = False
+        self.search = Gtk.SearchEntry(placeholder_text="Type to search, Enter to copy", hexpand=True)
+        header = Adw.HeaderBar(title_widget=self.search, show_end_title_buttons=False)
+
+        self.listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.BROWSE)
+        self.listbox.add_css_class("navigation-sidebar")
+        self.listbox.set_filter_func(self._filter)
+        self.listbox.connect("row-activated", lambda _lb, row: self.copy(row))
+        usage = load_usage()
+        codes.sort(key=lambda c: (not c["pinned"], -usage.get(code_id(c), 0), c["issuer"].lower()))
+        self.rows = [CodeRow(c) for c in codes]
+        for r in self.rows:
+            self.listbox.append(r)
+
+        scroller = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER, child=self.listbox)
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        if not codes:
+            body.append(Adw.StatusPage(icon_name="dialog-password-symbolic", title="No codes found",
+                                       description="\n".join(problems) or "Sign in to Ente Auth first.", vexpand=True))
+        else:
+            body.append(scroller)
+            if problems:
+                b = Adw.Banner(title=" · ".join(problems), revealed=True)
+                body.prepend(b)
+
+        tv = Adw.ToolbarView(content=body)
+        tv.add_top_bar(header)
+        self.set_content(tv)
+
+        self.search.connect("search-changed", self._on_search)
+        self.search.connect("activate", lambda *_: self.copy(self._current()))
+        self.search.connect("stop-search", lambda *_: self.close())
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", self._on_key)
+        self.add_controller(keys)
+        self.search.set_key_capture_widget(self)
+        self._select_first()
+        GLib.timeout_add(500, self._tick)
+
+    def _filter(self, row):
+        words = self.search.get_text().lower().split()
+        return all(w in row.haystack for w in words)
+
+    def _visible(self):
+        return [r for r in self.rows if r.get_child_visible() and self._filter(r)]
+
+    def _select_first(self):
+        v = self._visible()
+        if v:
+            self.listbox.select_row(v[0])
+
+    def _current(self):
+        r = self.listbox.get_selected_row()
+        if r is None or not self._filter(r):
+            v = self._visible()
+            r = v[0] if v else None
+        return r
+
+    def _on_search(self, *_):
+        self.listbox.invalidate_filter()
+        self._select_first()
+
+    def _on_key(self, _ctl, keyval, _code, _state):
+        if keyval == Gdk.KEY_Escape:
+            self.close()
+            return True
+        if keyval in (Gdk.KEY_Down, Gdk.KEY_Up):
+            v = self._visible()
+            if not v:
+                return True
+            cur = self.listbox.get_selected_row()
+            i = v.index(cur) if cur in v else -1
+            i = min(i + 1, len(v) - 1) if keyval == Gdk.KEY_Down else max(i - 1, 0)
+            self.listbox.select_row(v[i])
+            v[i].grab_focus()
+            self.search.grab_focus_without_selecting()
+            return True
+        return False
+
+    def _tick(self):
+        for r in self.rows:
+            r.tick()
+        return True
+
+    def copy(self, row):
+        if row is None or row.c["type"] == "hotp" or self.copied:
+            return
+        self.copied = True
+        # Copy from this (focused) window so clipboard managers can recognise and
+        # skip it, then keep the process alive as the clipboard owner until it
+        # is cleared. When we exit, the code leaves the clipboard with us.
+        code = otp(row.c)
+        self.get_clipboard().set(code)
+        GLib.timeout_add(200, self._verify_copy, code)
+        bump_usage(row.c)
+        subprocess.Popen(["notify-send", "-a", "Ente codes", "-i", "enteauth", "-t", "2500",
+                          f"{row.c['issuer']} code copied", f"{row.c['group']} · clears in {CLIPBOARD_CLEAR_SECONDS}s"])
+        self.get_application().hold_clipboard(self)
+
+    def _verify_copy(self, code):
+        # The compositor can reject a clipboard change it doesn't tie to user
+        # input. Check what other apps actually see; fall back to wl-copy.
+        # Must be async: wl-paste asks *this* process for the data.
+        app = self.get_application()
+        proc = Gio.Subprocess.new(["wl-paste", "-n"], Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE)
+
+        def done(p, res):
+            try:
+                _ok, out, _err = p.communicate_utf8_finish(res)
+            except GLib.Error:
+                out = None
+            if out != code:
+                app.fallback_code = code  # set first: wl-copy fires "changed"
+                subprocess.run(["wl-copy", "--", code], check=False)
+            self.close()
+
+        proc.communicate_utf8_async(None, None, done)
+        return False
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id="local.ente.Quick")
+        self.win = None
+        self._held = False
+        self._clear_timer = 0
+        self._clip_handler = 0
+        self.fallback_code = None
+
+    def hold_clipboard(self, win):
+        clip = win.get_clipboard()
+        if self._clear_timer:
+            GLib.source_remove(self._clear_timer)
+        if not self._held:
+            self._held = True
+            self.hold()
+            # Someone else copied something → we no longer own it; stop early.
+            self._clip_handler = clip.connect("changed", lambda c: None if (c.is_local() or self.fallback_code) else self._release(c, clear=False))
+        self._clear_timer = GLib.timeout_add_seconds(CLIPBOARD_CLEAR_SECONDS, self._release, clip, True)
+
+    def _release(self, clip, clear=True):
+        # From the timer (clear=True) the source ends by returning False;
+        # from the "changed" signal we must cancel the pending timer ourselves.
+        if self._clear_timer and not clear:
+            GLib.source_remove(self._clear_timer)
+        self._clear_timer = 0
+        if self._clip_handler:
+            clip.disconnect(self._clip_handler)
+            self._clip_handler = 0
+        # GNOME keeps clipboard contents after the owner exits, and refuses a
+        # clear that isn't tied to user input, so clear through wl-copy.
+        if clear and clip.is_local():
+            subprocess.run(["wl-copy", "--clear"], check=False, timeout=3)
+        elif clear and self.fallback_code:
+            subprocess.run(["sh", "-c", '[ "$(wl-paste -n 2>/dev/null)" = "$1" ] && wl-copy --clear', "_",
+                            self.fallback_code], check=False, timeout=3)
+        self.fallback_code = None
+        if self._held:
+            self._held = False
+            self.release()
+        return False
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        p = Gtk.CssProvider()
+        p.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), p,
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    def do_activate(self):
+        if self.win:  # shortcut pressed again while open → close (toggle)
+            self.win.close()
+            return
+        codes, problems = load_codes()
+        self.win = Win(self, codes, problems)
+        self.win.connect("close-request", self._on_close)
+        self.win.present()
+        self.win.search.grab_focus()
+
+    def _on_close(self, win):
+        if self.win is win:
+            self.win = None
+        return False  # let it close; the app exits once nothing holds it
+
+
+if __name__ == "__main__":
+    if "--check" in sys.argv:
+        codes, problems = load_codes()
+        for g, _ in ACCOUNTS:
+            print(f"{g}: {sum(1 for c in codes if c['group'] == g)} codes")
+        for p in problems:
+            print("note:", p)
+        sys.exit(0)
+    sys.exit(App().run([]))

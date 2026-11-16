@@ -1,0 +1,12 @@
+#!/bin/sh
+# Re-create the "Personal" copy of Ente Auth from the installed one after an update.
+# Data lives in ~/.local/share/io.ente.autw and is not touched.
+set -e
+D="$HOME/.local/opt/enteauth-personal"
+pkill -f "$D/enteauth" 2>/dev/null || true
+mkdir -p "$(dirname "$D")"; rm -rf "$D"; cp -a /usr/share/enteauth "$D"
+for f in "$D/enteauth" "$D/lib/libflutter_secure_storage_linux_plugin.so"; do
+  perl -pi -e 's/io\.ente\.auth/io.ente.autw/g' "$f"
+  grep -q -a 'io\.ente\.autw' "$f" || { echo "patch failed: $f" >&2; exit 1; }
+done
+echo "Ente Auth (Personal) refreshed from /usr/share/enteauth"
