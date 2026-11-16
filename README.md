@@ -1,6 +1,6 @@
 # ente-quick
 
-Run two [Ente Auth](https://ente.io/auth) accounts side by side on Linux, and copy any 2FA code with a keyboard shortcut.
+Run two [Ente Auth](https://ente.io/auth) accounts side by side on Linux and Android, and copy any 2FA code on Linux with a keyboard shortcut.
 
 - **Two accounts:** a second Ente Auth install (e.g. Work + Personal) with its own data, login and keyring entry. Codes never mix or sync between them.
 - **Quick copy:** press `Ctrl+Alt+A`, type a few letters, press `Enter`. The code is copied, kept out of clipboard history, and cleared after 30 s.
@@ -74,6 +74,22 @@ Edit the top of `bin/ente-quick`, then re-run `./install.sh`:
 | Personal copy won't start after an update | Run `enteauth-personal-update`. |
 | A new code is missing | Open that Ente Auth app so it syncs. |
 | HOTP code shows "use app" | Counter-based codes must be used in the app (it advances the counter). |
+
+## Android
+
+A second Ente Auth as a normal app, without the phone's "dual apps" feature. Same idea as on Linux: the app is repackaged under a new app ID (`io.ente.auth.personal`) and signed with your own key.
+
+```sh
+android/build-apk.sh             # phone connected over USB debugging
+android/build-apk.sh ente.apk    # or build from an APK file
+```
+
+Needs `java`, `adb` and `curl`; it downloads [apktool](https://github.com/iBotPeaches/Apktool) and [uber-apk-signer](https://github.com/patrickfav/uber-apk-signer) on first run. Works with the GitHub/F-Droid build (`io.ente.auth.independent`, default); for the Play Store build set `ENTE_SOURCE_PKG=io.ente.auth`. Change the ID or name with `ENTE_ANDROID_ID` / `ENTE_ANDROID_LABEL`.
+
+- **Updates:** the copy doesn't auto-update. After updating Ente Auth on the phone, re-run the script.
+- **Back up `~/.local/share/ente-quick/android.jks` and `android.pass`.** Without that key, updates won't install over the copy and you'd have to reinstall and sign in again.
+
+Tested on a Xiaomi 11T Pro (HyperOS 1, Android 14), Ente Auth 4.4.26.
 
 ## Uninstall
 
