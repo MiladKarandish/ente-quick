@@ -3,6 +3,9 @@
 Two Ente Auth accounts (Work + Personal) side by side on Linux, plus a
 keyboard popup to search and copy 2FA codes from both without opening the apps.
 
+> Unofficial. Not affiliated with or endorsed by Ente. It contains no Ente code;
+> it works with an Ente Auth you already installed (the `.deb` build).
+
 ## What's in here
 
 | File | What it does |
@@ -35,6 +38,17 @@ in `~/.local/share/io.ente.autw` and its own keyring entry. No rebuild needed.
 - Pinned codes first, then most used (`~/.local/state/ente-quick/usage.json`
   stores only hashed names and counts). Trashed codes hidden. HOTP shows "use app".
 
+## Security notes
+
+- The popup can read codes only from the logged-in user's **unlocked** GNOME
+  keyring. Any program running as you can already do the same: that is how
+  Ente Auth stores its key on Linux. This tool adds no new access.
+- Codes are copied to the clipboard and cleared after 30 seconds. Other
+  clipboard managers than Clipboard Indicator may still record them; exclude
+  the app IDs `local.ente.Quick`, `io.ente.auth` and `io.ente.autw` there.
+- Ente Auth's own app lock (PIN/password inside the app) is **not** applied to
+  the popup. If you rely on it, lock your screen or don't install the popup.
+
 ## Install / reinstall
 
 ```sh
@@ -49,6 +63,10 @@ Note: re-running closes the Personal copy if it is open (it gets rebuilt).
 ```sh
 enteauth-personal-update
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
 
 ## Tested on
 
